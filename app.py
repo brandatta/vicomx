@@ -51,7 +51,6 @@ def gen_numero(pref="COMEX"):
 
 # --------- Estados / Meta (según tus DDL) ---------
 def get_estados(conn):
-    # comex_estados: (estado varchar, id int) PK (estado,id)
     sql = "SELECT id, estado FROM comex_estados ORDER BY id"
     with conn.cursor() as cur:
         cur.execute(sql)
@@ -76,9 +75,6 @@ def insert_pedido_meta(conn, pedido: str, estado_texto: str, usr: str):
         cur.execute(sql, (pedido, estado_texto, ts, usr))
 
 def get_pedidos_with_estado_actual(conn, limit=300):
-    """
-    Trae pedidos desde sap_comex y su estado actual desde pedidos_meta_id (último ts).
-    """
     sql = """
     SELECT
       p.NUMERO AS pedido,
@@ -108,6 +104,20 @@ def get_pedidos_with_estado_actual(conn, limit=300):
     with conn.cursor() as cur:
         cur.execute(sql, (limit,))
         return cur.fetchall()
+
+def get_trazabilidad(conn, pedido: str):
+    """
+    Devuelve el historial completo del pedido desde pedidos_meta_id
+    """
+    sql = """
+        SELECT id, pedido, estado, ts, usr
+        FROM pedidos_meta_id
+        WHERE pedido = %s
+        ORDER BY ts ASC, id ASC
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (pedido,))
+        return pd.DataFrame(cur.fetchall())
 
 # --------- sap_comex lines ---------
 def insert_lines(conn, df, numero, user_email):
@@ -263,12 +273,7 @@ with tab1:
                     insert_lines(conn, grp, numero, user_email.strip())
 
                     # LOG estado inicial en pedidos_meta_id
-                    insert_pedido_meta(
-                        conn,
-                        pedido=numero,
-                        estado_texto=estado_inicial,
-                        usr=user_email.strip(),
-                    )
+                    insert_pedido_meta(conn, pedido=numero, estado_texto=estado_inicial, usr=user_email.strip())
 
                     created.append({"pedido": numero, "cliente": int(cli), "rs": rs, "estado": estado_inicial})
 
@@ -282,9 +287,9 @@ with tab1:
             finally:
                 conn.close()
 
-# =============== TAB 2: PEDIDOS (EDIT + ESTADO) ===============
+# =============== TAB 2: PEDIDOS (EDIT + ESTADO + TRAZABILIDAD) ===============
 with tab2:
-    st.subheader("Pedidos: editar líneas y cambiar estado")
+    st.subheader("Pedidos: editar líneas, cambiar estado y ver trazabilidad")
 
     user_email_pedidos = st.text_input("Usuario (email) para registrar cambios de estado", key="email_pedidos")
 
@@ -295,7 +300,6 @@ with tab2:
             st.error("La tabla comex_estados no tiene registros.")
             st.stop()
 
-        # Lista de estados por texto (lo que se guarda en pedidos_meta_id.estado)
         estados_textos = [r["estado"] for r in estados_rows]
 
         pedidos = get_pedidos_with_estado_actual(conn, limit=300)
@@ -320,7 +324,20 @@ with tab2:
 
         st.divider()
 
-        # --- Editor de líneas ---
+        # ------- Panel de detalle (Trazabilidad) -------
+        with st.expander("🧾 Detalle / Trazabilidad del pedido", expanded=True):
+            traz = get_trazabilidad(conn, pedido_sel)
+            if traz.empty:
+                st.info("Este pedido no tiene trazabilidad registrada en pedidos_meta_id.")
+            else:
+                # Estado actual (última fila)
+                last = traz.iloc[-1]
+                st.markdown(f"**Estado actual:** `{last['estado']}`  \n**Último cambio:** {last['ts']}  \n**Usuario:** {last['usr']}")
+                st.dataframe(traz, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ------- Editor de líneas -------
         df_lines = load_pedido_lines(conn, pedido_sel)
         if df_lines.empty:
             st.warning("El pedido no tiene líneas.")
@@ -348,8 +365,7 @@ with tab2:
 
         st.divider()
 
-        # --- Cambio de estado ---
-        # Preselección del estado actual
+        # ------- Cambio de estado -------
         if estado_actual in estados_textos:
             default_idx = estados_textos.index(estado_actual)
         else:
@@ -395,17 +411,11 @@ with tab2:
                     st.error("Ingresá el email del usuario para registrar el cambio de estado.")
                     st.stop()
 
-                # Evitar duplicar el mismo estado (por defecto)
                 if estado_actual == new_estado:
                     st.info("El pedido ya está en ese estado. No se registró un nuevo movimiento.")
                 else:
                     try:
-                        insert_pedido_meta(
-                            conn,
-                            pedido=pedido_sel,
-                            estado_texto=new_estado,
-                            usr=user_email_pedidos.strip(),
-                        )
+                        insert_pedido_meta(conn, pedido=pedido_sel, estado_texto=new_estado, usr=user_email_pedidos.strip())
                         conn.commit()
                         st.success(f"Estado '{new_estado}' registrado en pedidos_meta_id.")
                     except Exception as e:
