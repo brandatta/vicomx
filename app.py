@@ -88,7 +88,7 @@ def get_trazabilidad(conn, pedido: str):
 # --- Pedidos con proveedor + estado actual (para filtros) ---
 def get_pedidos_index(conn, limit=1000):
     """
-    Index para UI: proveedor (CLIENTE), rs, pedido, ts, estado actual.
+    Index para UI: proveedor (CLIENTE), razon social (rs), pedido, ts, estado actual.
     Toma proveedor desde sap_comex (MAX(CLIENTE)) y estado actual desde pedidos_meta_id.
     """
     sql = """
@@ -139,7 +139,7 @@ def insert_lines(conn, df, numero, user_email):
                 r["COD_ALFA"],
                 float(r["CANTIDAD"]),
                 float(r["PRECIO"]),
-                r["rs"],
+                r["RAZON SOCIAL"],  # antes: r["rs"]
                 item,
                 "CX",
                 0,
@@ -204,12 +204,12 @@ def update_pedido_lines(conn, numero, df_edit):
         cur.executemany(sql, payload)
 
 # ---------------- UI ----------------
-tab1, tab2 = st.tabs(["➕ Nuevo pedido", "📦 Pedidos"])
+tab1, tab2 = st.tabs(["➕ Nuevo Pedido", "📦 Pedidos"])
 
 # =============== TAB 1: NUEVO PEDIDO ===============
 with tab1:
-    user_email = st.text_input("Usuario (email)", key="email_new")
-    file = st.file_uploader("Subir Excel", type=["xlsx"])
+    user_email = st.text_input("Usuario", key="email_new")
+    file = st.file_uploader("Seleccionar planilla Excel", type=["xlsx"])
 
     if file:
         df = pd.read_excel(file)
@@ -239,11 +239,14 @@ with tab1:
 
         df2 = df.merge(art, on="cod_alfa", how="left")
         df2["CLIENTE"] = df2["proveedor"]
-        df2["rs"] = df2["nombre"]
+        df2["RAZON SOCIAL"] = df2["nombre"]
         df2.rename(columns={"cod_alfa": "COD_ALFA", "price": "PRECIO", "quantity": "CANTIDAD"}, inplace=True)
 
-        st.subheader("Preview")
-        st.dataframe(df2, use_container_width=True)
+        # Mostrar todo en MAYÚSCULAS en la UI
+        df2_ui = df2.rename(columns={"proveedor": "PROVEEDOR", "nombre": "NOMBRE"}).copy()
+
+        st.subheader("Vista Previa")
+        st.dataframe(df2_ui, use_container_width=True)
 
         sin = df2[df2["CLIENTE"].isna()]
         if len(sin):
@@ -251,23 +254,23 @@ with tab1:
             st.dataframe(sin[["COD_ALFA"]], use_container_width=True)
             st.stop()
 
-        resumen = df2.groupby(["CLIENTE", "rs"], as_index=False).agg(
-            items=("COD_ALFA", "count"),
-            total_qty=("CANTIDAD", "sum"),
+        resumen = df2.groupby(["CLIENTE", "RAZON SOCIAL"], as_index=False).agg(
+            ITEMS=("COD_ALFA", "count"),
+            CANTIDAD_TOTAL=("CANTIDAD", "sum"),
         )
-        resumen["total_usd"] = (
-            df2.assign(imp=df2["CANTIDAD"] * df2["PRECIO"])
-            .groupby(["CLIENTE", "rs"])["imp"]
+        resumen["ST_USD"] = (
+            df2.assign(IMP=df2["CANTIDAD"] * df2["PRECIO"])
+            .groupby(["CLIENTE", "RAZON SOCIAL"])["IMP"]
             .sum()
             .values
         )
 
-        st.subheader("Pedidos a generar (1 por proveedor)")
+        st.subheader("Pedidos a Generar en vicomx")
         st.dataframe(resumen, use_container_width=True)
 
-        if st.button("Confirmar e insertar", type="primary"):
+        if st.button("Generar en vicomx", type="primary"):
             if not user_email.strip():
-                st.error("Ingresá el email del usuario antes de confirmar.")
+                st.error("Ingresá el usuario antes de confirmar.")
                 st.stop()
 
             conn = get_conn()
@@ -275,14 +278,14 @@ with tab1:
                 estado_inicial = get_estado_texto_por_id(conn, DEFAULT_ESTADO_ID)
 
                 created = []
-                for (cli, rs), grp in df2.groupby(["CLIENTE", "rs"]):
+                for (cli, razon), grp in df2.groupby(["CLIENTE", "RAZON SOCIAL"]):
                     numero = gen_numero(f"COMEX-P{int(cli)}")
                     insert_lines(conn, grp, numero, user_email.strip())
 
                     # LOG estado inicial en pedidos_meta_id
                     insert_pedido_meta(conn, pedido=numero, estado_texto=estado_inicial, usr=user_email.strip())
 
-                    created.append({"pedido": numero, "proveedor": int(cli), "rs": rs, "estado": estado_inicial})
+                    created.append({"PEDIDO": numero, "PROVEEDOR": int(cli), "RAZON SOCIAL": razon, "ESTADO": estado_inicial})
 
                 conn.commit()
                 st.success("Pedidos generados y registrados en pedidos_meta_id.")
@@ -296,9 +299,7 @@ with tab1:
 
 # =============== TAB 2: PEDIDOS (2 SELECTBOX: PROVEEDOR + PEDIDO) ===============
 with tab2:
-    st.subheader("Pedidos: proveedor → pedido (detalle, edición y trazabilidad)")
-
-    user_email_pedidos = st.text_input("Usuario (email) para registrar cambios de estado", key="email_pedidos")
+    user_email_pedidos = st.text_input("Usuario", key="email_pedidos")
 
     conn = get_conn()
     try:
@@ -313,15 +314,14 @@ with tab2:
             st.info("No hay pedidos cargados todavía.")
             st.stop()
 
-        # -------- Selectores lado a lado: Proveedor (izq) y Pedido (der) --------
-        # Proveedor: mostramos "cliente - rs"
+        # -------- Selectores lado a lado: PROVEEDOR (izq) y PEDIDO (der) --------
         idx["proveedor_label"] = idx["proveedor"].astype(str) + " - " + idx["rs"].fillna("")
         proveedores = idx[["proveedor", "rs", "proveedor_label"]].drop_duplicates().sort_values("proveedor_label")
 
         cL, cR = st.columns([1, 2])
 
         with cL:
-            prov_label = st.selectbox("Proveedor", proveedores["proveedor_label"].tolist(), index=0)
+            prov_label = st.selectbox("PROVEEDOR", proveedores["proveedor_label"].tolist(), index=0)
 
         prov_row = proveedores[proveedores["proveedor_label"] == prov_label].iloc[0]
         prov_id = prov_row["proveedor"]
@@ -342,7 +342,7 @@ with tab2:
             st.stop()
 
         with cR:
-            pedido_label = st.selectbox("Pedido", pedidos_prov["pedido_label"].tolist(), index=0)
+            pedido_label = st.selectbox("PEDIDO", pedidos_prov["pedido_label"].tolist(), index=0)
 
         pedido_sel = pedidos_prov[pedidos_prov["pedido_label"] == pedido_label].iloc[0]["pedido"]
         estado_actual = pedidos_prov[pedidos_prov["pedido"] == pedido_sel].iloc[0]["estado_texto"]
@@ -361,11 +361,12 @@ with tab2:
             else:
                 last = traz.iloc[-1]
                 st.markdown(
-                    f"**Estado actual:** `{last['estado']}`  \n"
+                    f"**Estado Actual:** `{last['estado']}`  \n"
                     f"**Último cambio:** {last['ts']}  \n"
                     f"**Usuario:** {last['usr']}"
                 )
-                st.dataframe(traz, use_container_width=True, hide_index=True)
+                traz_ui = traz.rename(columns={"pedido": "PEDIDO", "estado": "ESTADO", "ts": "TS", "usr": "USR"})
+                st.dataframe(traz_ui, use_container_width=True, hide_index=True)
 
         st.divider()
 
@@ -375,12 +376,15 @@ with tab2:
             st.warning("El pedido no tiene líneas.")
             st.stop()
 
+        # UI: columnas en mayúscula y rs como RAZON SOCIAL
+        df_lines_ui = df_lines.rename(columns={"rs": "RAZON SOCIAL", "user_email": "USER_EMAIL"}).copy()
+
         st.caption("Editá únicamente CANTIDAD y PRECIO. Guardá para persistir en MySQL.")
         edited = st.data_editor(
-            df_lines,
+            df_lines_ui,
             use_container_width=True,
             hide_index=True,
-            disabled=["ITEM", "COD_ALFA", "rs", "TS", "user_email", "sap_ready", "proc_sap"],
+            disabled=["ITEM", "COD_ALFA", "RAZON SOCIAL", "TS", "USER_EMAIL", "sap_ready", "proc_sap"],
             column_config={
                 "CANTIDAD": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.3f"),
                 "PRECIO": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.4f"),
@@ -391,8 +395,8 @@ with tab2:
         tmp = edited.copy()
         tmp["IMP"] = tmp["CANTIDAD"] * tmp["PRECIO"]
         c1, c2 = st.columns(2)
-        c1.metric("Total USD", f"{tmp['IMP'].sum():,.2f}")
-        c2.metric("Total Qty", f"{tmp['CANTIDAD'].sum():,.3f}")
+        c1.metric("ST USD", f"{tmp['IMP'].sum():,.2f}")
+        c2.metric("Cantidad Total", f"{tmp['CANTIDAD'].sum():,.3f}")
 
         st.divider()
 
@@ -427,6 +431,7 @@ with tab2:
                     st.error("Valores inválidos (cantidad/precio deben ser numéricos y > 0).")
                     st.stop()
 
+                # Convertir de UI -> columnas reales para update
                 df_to_save = edited[["ITEM", "CANTIDAD", "PRECIO"]].copy()
                 try:
                     update_pedido_lines(conn, pedido_sel, df_to_save)
@@ -439,7 +444,7 @@ with tab2:
         with colB:
             if st.button("🧾 Registrar cambio de estado", type="secondary"):
                 if not user_email_pedidos.strip():
-                    st.error("Ingresá el email del usuario para registrar el cambio de estado.")
+                    st.error("Ingresá el usuario para registrar el cambio de estado.")
                     st.stop()
 
                 if estado_actual == new_estado:
