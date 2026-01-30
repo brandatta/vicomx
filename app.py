@@ -87,10 +87,6 @@ def get_trazabilidad(conn, pedido: str):
 
 # --- Pedidos con proveedor + estado actual (para filtros) ---
 def get_pedidos_index(conn, limit=1000):
-    """
-    Index para UI: proveedor (CLIENTE), razon social (rs), pedido, ts, estado actual.
-    Toma proveedor desde sap_comex (MAX(CLIENTE)) y estado actual desde pedidos_meta_id.
-    """
     sql = """
     SELECT
       p.NUMERO AS pedido,
@@ -139,7 +135,7 @@ def insert_lines(conn, df, numero, user_email):
                 r["COD_ALFA"],
                 float(r["CANTIDAD"]),
                 float(r["PRECIO"]),
-                r["RAZON SOCIAL"],  # antes: r["rs"]
+                r["RAZON SOCIAL"],
                 item,
                 "CX",
                 0,
@@ -242,7 +238,6 @@ with tab1:
         df2["RAZON SOCIAL"] = df2["nombre"]
         df2.rename(columns={"cod_alfa": "COD_ALFA", "price": "PRECIO", "quantity": "CANTIDAD"}, inplace=True)
 
-        # Mostrar todo en MAYÚSCULAS en la UI
         df2_ui = df2.rename(columns={"proveedor": "PROVEEDOR", "nombre": "NOMBRE"}).copy()
 
         st.subheader("Vista Previa")
@@ -281,11 +276,10 @@ with tab1:
                 for (cli, razon), grp in df2.groupby(["CLIENTE", "RAZON SOCIAL"]):
                     numero = gen_numero(f"COMEX-P{int(cli)}")
                     insert_lines(conn, grp, numero, user_email.strip())
-
-                    # LOG estado inicial en pedidos_meta_id
                     insert_pedido_meta(conn, pedido=numero, estado_texto=estado_inicial, usr=user_email.strip())
-
-                    created.append({"PEDIDO": numero, "PROVEEDOR": int(cli), "RAZON SOCIAL": razon, "ESTADO": estado_inicial})
+                    created.append(
+                        {"PEDIDO": numero, "PROVEEDOR": int(cli), "RAZON SOCIAL": razon, "ESTADO": estado_inicial}
+                    )
 
                 conn.commit()
                 st.success("Pedidos generados y registrados en pedidos_meta_id.")
@@ -297,7 +291,7 @@ with tab1:
             finally:
                 conn.close()
 
-# =============== TAB 2: PEDIDOS (2 SELECTBOX: PROVEEDOR + PEDIDO) ===============
+# =============== TAB 2: PEDIDOS ===============
 with tab2:
     user_email_pedidos = st.text_input("Usuario", key="email_pedidos")
 
@@ -376,17 +370,16 @@ with tab2:
             st.warning("El pedido no tiene líneas.")
             st.stop()
 
-        # UI: columnas en mayúscula y rs como RAZON SOCIAL
         df_lines_ui = df_lines.rename(columns={"rs": "RAZON SOCIAL", "user_email": "USER_EMAIL"}).copy()
 
-        st.caption("Editá únicamente CANTIDAD y PRECIO. Guardá para persistir en MySQL.")
         edited = st.data_editor(
             df_lines_ui,
             use_container_width=True,
             hide_index=True,
             disabled=["ITEM", "COD_ALFA", "RAZON SOCIAL", "TS", "USER_EMAIL", "sap_ready", "proc_sap"],
             column_config={
-                "CANTIDAD": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.3f"),
+                # CANTIDAD SIN DECIMALES
+                "CANTIDAD": st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
                 "PRECIO": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.4f"),
             },
             key=f"edit_{pedido_sel}",
@@ -394,55 +387,58 @@ with tab2:
 
         tmp = edited.copy()
         tmp["IMP"] = tmp["CANTIDAD"] * tmp["PRECIO"]
+
+        # INVERTIR: primero Cantidad Total, luego ST USD
         c1, c2 = st.columns(2)
-        c1.metric("ST USD", f"{tmp['IMP'].sum():,.2f}")
-        c2.metric("Cantidad Total", f"{tmp['CANTIDAD'].sum():,.3f}")
+        c1.metric("Cantidad Total", f"{tmp['CANTIDAD'].sum():,.0f}")
+        c2.metric("ST USD", f"{tmp['IMP'].sum():,.2f}")
+
+        # Botón Guardar debajo de métricas (centrado)
+        if st.button("Guardar Modificaciones", type="primary"):
+            def validate_lines(dfv):
+                q = pd.to_numeric(dfv["CANTIDAD"], errors="coerce")
+                p = pd.to_numeric(dfv["PRECIO"], errors="coerce")
+                if q.isna().any() or p.isna().any():
+                    return False
+                if (q <= 0).any() or (p <= 0).any():
+                    return False
+                return True
+
+            if not validate_lines(edited):
+                st.error("Valores inválidos (cantidad/precio deben ser numéricos y > 0).")
+                st.stop()
+
+            df_to_save = edited[["ITEM", "CANTIDAD", "PRECIO"]].copy()
+            try:
+                update_pedido_lines(conn, pedido_sel, df_to_save)
+                conn.commit()
+                st.success("Líneas actualizadas.")
+            except Exception as e:
+                conn.rollback()
+                st.exception(e)
 
         st.divider()
 
-        # ------- Cambio de estado -------
+        # ------- Estado: dropdown + botón al lado -------
         if estado_actual in estados_textos:
             default_idx = estados_textos.index(estado_actual)
         else:
             default_idx = 0
 
         st.subheader("Estado del pedido")
-        new_estado = st.selectbox(
-            "Seleccioná nuevo estado",
-            estados_textos,
-            index=default_idx,
-            key=f"estado_{pedido_sel}",
-        )
+        e1, e2 = st.columns([3, 1])
 
-        def validate_lines(dfv):
-            q = pd.to_numeric(dfv["CANTIDAD"], errors="coerce")
-            p = pd.to_numeric(dfv["PRECIO"], errors="coerce")
-            if q.isna().any() or p.isna().any():
-                return False
-            if (q <= 0).any() or (p <= 0).any():
-                return False
-            return True
+        with e1:
+            new_estado = st.selectbox(
+                "Seleccioná nuevo estado",
+                estados_textos,
+                index=default_idx,
+                key=f"estado_{pedido_sel}",
+                label_visibility="visible",
+            )
 
-        colA, colB = st.columns([1, 1])
-
-        with colA:
-            if st.button("💾 Guardar cambios de líneas", type="primary"):
-                if not validate_lines(edited):
-                    st.error("Valores inválidos (cantidad/precio deben ser numéricos y > 0).")
-                    st.stop()
-
-                # Convertir de UI -> columnas reales para update
-                df_to_save = edited[["ITEM", "CANTIDAD", "PRECIO"]].copy()
-                try:
-                    update_pedido_lines(conn, pedido_sel, df_to_save)
-                    conn.commit()
-                    st.success("Líneas actualizadas.")
-                except Exception as e:
-                    conn.rollback()
-                    st.exception(e)
-
-        with colB:
-            if st.button("🧾 Registrar cambio de estado", type="secondary"):
+        with e2:
+            if st.button("Registrar cambio de estado", type="secondary"):
                 if not user_email_pedidos.strip():
                     st.error("Ingresá el usuario para registrar el cambio de estado.")
                     st.stop()
