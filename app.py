@@ -419,7 +419,7 @@ with tab2:
             try:
                 update_pedido_lines(conn, pedido_sel, df_to_save)
                 conn.commit()
-                st.success("Líneas actualizadas.")
+                st.success("Líneas Actualizadas.")
             except Exception as e:
                 conn.rollback()
                 st.exception(e)
