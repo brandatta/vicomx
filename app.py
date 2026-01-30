@@ -74,15 +74,36 @@ def insert_pedido_meta(conn, pedido: str, estado_texto: str, usr: str):
     with conn.cursor() as cur:
         cur.execute(sql, (pedido, estado_texto, ts, usr))
 
-def get_pedidos_with_estado_actual(conn, limit=300):
+def get_trazabilidad(conn, pedido: str):
+    sql = """
+        SELECT id, pedido, estado, ts, usr
+        FROM pedidos_meta_id
+        WHERE pedido = %s
+        ORDER BY ts ASC, id ASC
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (pedido,))
+        return pd.DataFrame(cur.fetchall())
+
+# --- Pedidos con proveedor + estado actual (para filtros) ---
+def get_pedidos_index(conn, limit=1000):
+    """
+    Index para UI: proveedor (CLIENTE), rs, pedido, ts, estado actual.
+    Toma proveedor desde sap_comex (MAX(CLIENTE)) y estado actual desde pedidos_meta_id.
+    """
     sql = """
     SELECT
       p.NUMERO AS pedido,
-      p.last_ts,
+      p.cliente AS proveedor,
       p.rs,
+      p.last_ts,
       pm.estado AS estado_texto
     FROM (
-      SELECT NUMERO, MAX(TS) AS last_ts, MAX(rs) AS rs
+      SELECT
+        NUMERO,
+        MAX(CLIENTE) AS cliente,
+        MAX(rs) AS rs,
+        MAX(TS) AS last_ts
       FROM sap_comex
       WHERE NUMERO IS NOT NULL AND NUMERO <> ''
       GROUP BY NUMERO
@@ -103,20 +124,6 @@ def get_pedidos_with_estado_actual(conn, limit=300):
     """
     with conn.cursor() as cur:
         cur.execute(sql, (limit,))
-        return cur.fetchall()
-
-def get_trazabilidad(conn, pedido: str):
-    """
-    Devuelve el historial completo del pedido desde pedidos_meta_id
-    """
-    sql = """
-        SELECT id, pedido, estado, ts, usr
-        FROM pedidos_meta_id
-        WHERE pedido = %s
-        ORDER BY ts ASC, id ASC
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (pedido,))
         return pd.DataFrame(cur.fetchall())
 
 # --------- sap_comex lines ---------
@@ -275,7 +282,7 @@ with tab1:
                     # LOG estado inicial en pedidos_meta_id
                     insert_pedido_meta(conn, pedido=numero, estado_texto=estado_inicial, usr=user_email.strip())
 
-                    created.append({"pedido": numero, "cliente": int(cli), "rs": rs, "estado": estado_inicial})
+                    created.append({"pedido": numero, "proveedor": int(cli), "rs": rs, "estado": estado_inicial})
 
                 conn.commit()
                 st.success("Pedidos generados y registrados en pedidos_meta_id.")
@@ -287,9 +294,9 @@ with tab1:
             finally:
                 conn.close()
 
-# =============== TAB 2: PEDIDOS (EDIT + ESTADO + TRAZABILIDAD) ===============
+# =============== TAB 2: PEDIDOS (2 SELECTBOX: PROVEEDOR + PEDIDO) ===============
 with tab2:
-    st.subheader("Pedidos: editar líneas, cambiar estado y ver trazabilidad")
+    st.subheader("Pedidos: proveedor → pedido (detalle, edición y trazabilidad)")
 
     user_email_pedidos = st.text_input("Usuario (email) para registrar cambios de estado", key="email_pedidos")
 
@@ -299,45 +306,70 @@ with tab2:
         if not estados_rows:
             st.error("La tabla comex_estados no tiene registros.")
             st.stop()
-
         estados_textos = [r["estado"] for r in estados_rows]
 
-        pedidos = get_pedidos_with_estado_actual(conn, limit=300)
-        if not pedidos:
+        idx = get_pedidos_index(conn, limit=2000)
+        if idx.empty:
             st.info("No hay pedidos cargados todavía.")
             st.stop()
 
-        meta = {}
-        labels = []
-        for p in pedidos:
-            pedido = p["pedido"]
-            estado = p["estado_texto"] or "(sin estado)"
-            rs = p.get("rs") or ""
-            last_ts = str(p.get("last_ts") or "")
-            label = f"{pedido}  |  {estado}  |  {rs}  |  {last_ts}"
-            labels.append(label)
-            meta[label] = {"pedido": pedido, "estado": estado if estado != "(sin estado)" else None}
+        # -------- Selectores lado a lado: Proveedor (izq) y Pedido (der) --------
+        # Proveedor: mostramos "cliente - rs"
+        idx["proveedor_label"] = idx["proveedor"].astype(str) + " - " + idx["rs"].fillna("")
+        proveedores = idx[["proveedor", "rs", "proveedor_label"]].drop_duplicates().sort_values("proveedor_label")
 
-        sel = st.selectbox("Seleccioná un pedido", labels, index=0)
-        pedido_sel = meta[sel]["pedido"]
-        estado_actual = meta[sel]["estado"]
+        cL, cR = st.columns([1, 2])
+
+        with cL:
+            prov_label = st.selectbox("Proveedor", proveedores["proveedor_label"].tolist(), index=0)
+
+        prov_row = proveedores[proveedores["proveedor_label"] == prov_label].iloc[0]
+        prov_id = prov_row["proveedor"]
+        prov_rs = prov_row["rs"]
+
+        pedidos_prov = idx[idx["proveedor"] == prov_id].copy()
+        pedidos_prov["estado_texto"] = pedidos_prov["estado_texto"].fillna("(sin estado)")
+        pedidos_prov["pedido_label"] = (
+            pedidos_prov["pedido"]
+            + " | "
+            + pedidos_prov["estado_texto"]
+            + " | "
+            + pedidos_prov["last_ts"].astype(str)
+        )
+
+        if pedidos_prov.empty:
+            st.warning("Este proveedor no tiene pedidos.")
+            st.stop()
+
+        with cR:
+            pedido_label = st.selectbox("Pedido", pedidos_prov["pedido_label"].tolist(), index=0)
+
+        pedido_sel = pedidos_prov[pedidos_prov["pedido_label"] == pedido_label].iloc[0]["pedido"]
+        estado_actual = pedidos_prov[pedidos_prov["pedido"] == pedido_sel].iloc[0]["estado_texto"]
+        if estado_actual == "(sin estado)":
+            estado_actual = None
+
+        st.caption(f"Proveedor seleccionado: **{prov_id} - {prov_rs}**")
 
         st.divider()
 
-        # ------- Panel de detalle (Trazabilidad) -------
+        # ------- Trazabilidad -------
         with st.expander("🧾 Detalle / Trazabilidad del pedido", expanded=True):
             traz = get_trazabilidad(conn, pedido_sel)
             if traz.empty:
                 st.info("Este pedido no tiene trazabilidad registrada en pedidos_meta_id.")
             else:
-                # Estado actual (última fila)
                 last = traz.iloc[-1]
-                st.markdown(f"**Estado actual:** `{last['estado']}`  \n**Último cambio:** {last['ts']}  \n**Usuario:** {last['usr']}")
+                st.markdown(
+                    f"**Estado actual:** `{last['estado']}`  \n"
+                    f"**Último cambio:** {last['ts']}  \n"
+                    f"**Usuario:** {last['usr']}"
+                )
                 st.dataframe(traz, use_container_width=True, hide_index=True)
 
         st.divider()
 
-        # ------- Editor de líneas -------
+        # ------- Líneas del pedido (editar) -------
         df_lines = load_pedido_lines(conn, pedido_sel)
         if df_lines.empty:
             st.warning("El pedido no tiene líneas.")
@@ -356,7 +388,6 @@ with tab2:
             key=f"edit_{pedido_sel}",
         )
 
-        # Totales en vivo
         tmp = edited.copy()
         tmp["IMP"] = tmp["CANTIDAD"] * tmp["PRECIO"]
         c1, c2 = st.columns(2)
