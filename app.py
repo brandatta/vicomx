@@ -378,7 +378,6 @@ with tab2:
             hide_index=True,
             disabled=["ITEM", "COD_ALFA", "RAZON SOCIAL", "TS", "USER_EMAIL", "sap_ready", "proc_sap"],
             column_config={
-                # CANTIDAD SIN DECIMALES
                 "CANTIDAD": st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
                 "PRECIO": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.4f"),
             },
@@ -393,7 +392,7 @@ with tab2:
         c1.metric("Cantidad Total", f"{tmp['CANTIDAD'].sum():,.0f}")
         c2.metric("ST USD", f"{tmp['IMP'].sum():,.2f}")
 
-        # Botón Guardar debajo de métricas (centrado)
+        # Guardar debajo de métricas
         if st.button("Guardar Modificaciones", type="primary"):
             def validate_lines(dfv):
                 q = pd.to_numeric(dfv["CANTIDAD"], errors="coerce")
@@ -419,14 +418,14 @@ with tab2:
 
         st.divider()
 
-        # ------- Estado: dropdown + botón al lado -------
+        # ------- Estado: dropdown + botón al lado (alineado) -------
         if estado_actual in estados_textos:
             default_idx = estados_textos.index(estado_actual)
         else:
             default_idx = 0
 
         st.subheader("Estado del pedido")
-        e1, e2 = st.columns([3, 1])
+        e1, e2 = st.columns([3, 1], vertical_alignment="bottom")
 
         with e1:
             new_estado = st.selectbox(
@@ -438,6 +437,8 @@ with tab2:
             )
 
         with e2:
+            # Spacer para alinear visualmente el botón con el selectbox
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
             if st.button("Registrar cambio de estado", type="secondary"):
                 if not user_email_pedidos.strip():
                     st.error("Ingresá el usuario para registrar el cambio de estado.")
@@ -447,7 +448,12 @@ with tab2:
                     st.info("El pedido ya está en ese estado. No se registró un nuevo movimiento.")
                 else:
                     try:
-                        insert_pedido_meta(conn, pedido=pedido_sel, estado_texto=new_estado, usr=user_email_pedidos.strip())
+                        insert_pedido_meta(
+                            conn,
+                            pedido=pedido_sel,
+                            estado_texto=new_estado,
+                            usr=user_email_pedidos.strip(),
+                        )
                         conn.commit()
                         st.success(f"Estado '{new_estado}' registrado en pedidos_meta_id.")
                     except Exception as e:
