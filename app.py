@@ -204,12 +204,12 @@ def update_pedido_lines(conn, numero, df_edit):
         cur.executemany(sql, payload)
 
 # ---------------- UI ----------------
-tab1, tab2 = st.tabs(["➕ Nuevo Pedido", "📦 Pedidos"])
+tab1, tab2 = st.tabs(["➕ Nuevo pedido", "📦 Pedidos"])
 
 # =============== TAB 1: NUEVO PEDIDO ===============
 with tab1:
-    user_email = st.text_input("Usuario", key="email_new")
-    file = st.file_uploader("Seleccionar planilla Excel", type=["xlsx"])
+    user_email = st.text_input("Usuario (email)", key="email_new")
+    file = st.file_uploader("Subir Excel", type=["xlsx"])
 
     if file:
         df = pd.read_excel(file)
@@ -242,7 +242,7 @@ with tab1:
         df2["rs"] = df2["nombre"]
         df2.rename(columns={"cod_alfa": "COD_ALFA", "price": "PRECIO", "quantity": "CANTIDAD"}, inplace=True)
 
-        st.subheader("Vista Previa")
+        st.subheader("Preview")
         st.dataframe(df2, use_container_width=True)
 
         sin = df2[df2["CLIENTE"].isna()]
@@ -262,10 +262,10 @@ with tab1:
             .values
         )
 
-        st.subheader("Pedidos a Generar en vicomx")
+        st.subheader("Pedidos a generar (1 por proveedor)")
         st.dataframe(resumen, use_container_width=True)
 
-        if st.button("Generar en vicomx", type="primary"):
+        if st.button("Confirmar e insertar", type="primary"):
             if not user_email.strip():
                 st.error("Ingresá el email del usuario antes de confirmar.")
                 st.stop()
@@ -295,8 +295,10 @@ with tab1:
                 conn.close()
 
 # =============== TAB 2: PEDIDOS (2 SELECTBOX: PROVEEDOR + PEDIDO) ===============
+with tab2:
+    st.subheader("Pedidos: proveedor → pedido (detalle, edición y trazabilidad)")
 
-    user_email_pedidos = st.text_input("Usuario", key="email_pedidos")
+    user_email_pedidos = st.text_input("Usuario (email) para registrar cambios de estado", key="email_pedidos")
 
     conn = get_conn()
     try:
@@ -359,7 +361,7 @@ with tab1:
             else:
                 last = traz.iloc[-1]
                 st.markdown(
-                    f"**Estado Actual:** `{last['estado']}`  \n"
+                    f"**Estado actual:** `{last['estado']}`  \n"
                     f"**Último cambio:** {last['ts']}  \n"
                     f"**Usuario:** {last['usr']}"
                 )
@@ -373,6 +375,7 @@ with tab1:
             st.warning("El pedido no tiene líneas.")
             st.stop()
 
+        st.caption("Editá únicamente CANTIDAD y PRECIO. Guardá para persistir en MySQL.")
         edited = st.data_editor(
             df_lines,
             use_container_width=True,
@@ -419,7 +422,7 @@ with tab1:
         colA, colB = st.columns([1, 1])
 
         with colA:
-            if st.button("💾 Guardar Modificaciones", type="primary"):
+            if st.button("💾 Guardar cambios de líneas", type="primary"):
                 if not validate_lines(edited):
                     st.error("Valores inválidos (cantidad/precio deben ser numéricos y > 0).")
                     st.stop()
