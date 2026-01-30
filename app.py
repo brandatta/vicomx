@@ -7,13 +7,13 @@ from uuid import uuid4
 
 # ---------------- CONFIG ----------------
 REQUIRED_COLS = ["cod_alfa", "price", "quantity"]
+DEFAULT_ESTADO_ID = 1  # equivale a "Armado" en comex_estados
 
 st.set_page_config(page_title="Pedidos COMEX", layout="wide")
 st.title("Pedidos COMEX")
 
 # ---------------- DB ----------------
 def get_conn():
-    # Soporta Streamlit Cloud Secrets o variables de entorno
     mysql_cfg = st.secrets.get("mysql", {})
     host = mysql_cfg.get("host") or os.getenv("MYSQL_HOST")
     user = mysql_cfg.get("user") or os.getenv("MYSQL_USER")
@@ -49,6 +49,67 @@ def gen_numero(pref="COMEX"):
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     return f"{pref}-{ts}-{str(uuid4())[:4]}"
 
+# --------- Estados / Meta (según tus DDL) ---------
+def get_estados(conn):
+    # comex_estados: (estado varchar, id int) PK (estado,id)
+    sql = "SELECT id, estado FROM comex_estados ORDER BY id"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return cur.fetchall()
+
+def get_estado_texto_por_id(conn, estado_id: int) -> str:
+    sql = "SELECT estado FROM comex_estados WHERE id = %s LIMIT 1"
+    with conn.cursor() as cur:
+        cur.execute(sql, (int(estado_id),))
+        row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"No existe comex_estados.id={estado_id}.")
+    return row["estado"]
+
+def insert_pedido_meta(conn, pedido: str, estado_texto: str, usr: str):
+    ts = datetime.now()
+    sql = """
+        INSERT INTO pedidos_meta_id (pedido, estado, ts, usr)
+        VALUES (%s, %s, %s, %s)
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (pedido, estado_texto, ts, usr))
+
+def get_pedidos_with_estado_actual(conn, limit=300):
+    """
+    Trae pedidos desde sap_comex y su estado actual desde pedidos_meta_id (último ts).
+    """
+    sql = """
+    SELECT
+      p.NUMERO AS pedido,
+      p.last_ts,
+      p.rs,
+      pm.estado AS estado_texto
+    FROM (
+      SELECT NUMERO, MAX(TS) AS last_ts, MAX(rs) AS rs
+      FROM sap_comex
+      WHERE NUMERO IS NOT NULL AND NUMERO <> ''
+      GROUP BY NUMERO
+    ) p
+    LEFT JOIN (
+      SELECT x.pedido, x.estado, x.ts
+      FROM pedidos_meta_id x
+      INNER JOIN (
+        SELECT pedido, MAX(ts) AS max_ts
+        FROM pedidos_meta_id
+        GROUP BY pedido
+      ) y
+      ON x.pedido = y.pedido AND x.ts = y.max_ts
+    ) pm
+      ON pm.pedido = p.NUMERO
+    ORDER BY p.last_ts DESC
+    LIMIT %s
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (limit,))
+        return cur.fetchall()
+
+# --------- sap_comex lines ---------
 def insert_lines(conn, df, numero, user_email):
     now = datetime.now()
     rows = []
@@ -90,21 +151,6 @@ def insert_lines(conn, df, numero, user_email):
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
 
-def list_pedidos(conn, limit=200):
-    # Si querés filtrar solo los de esta app:
-    # AND app='CX'
-    sql = """
-        SELECT NUMERO, MAX(TS) AS last_ts, MAX(rs) AS rs
-        FROM sap_comex
-        WHERE NUMERO IS NOT NULL AND NUMERO <> ''
-        GROUP BY NUMERO
-        ORDER BY last_ts DESC
-        LIMIT %s
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (limit,))
-        return cur.fetchall()
-
 def load_pedido_lines(conn, numero):
     sql = """
         SELECT
@@ -118,10 +164,6 @@ def load_pedido_lines(conn, numero):
         return pd.DataFrame(cur.fetchall())
 
 def update_pedido_lines(conn, numero, df_edit):
-    """
-    df_edit debe tener: ITEM, CANTIDAD, PRECIO
-    Actualiza por (NUMERO, ITEM) (tenés uq_doc_item)
-    """
     sql = """
         UPDATE sap_comex
         SET CANTIDAD = %s,
@@ -147,8 +189,9 @@ def update_pedido_lines(conn, numero, df_edit):
 # ---------------- UI ----------------
 tab1, tab2 = st.tabs(["➕ Nuevo pedido", "📦 Pedidos"])
 
+# =============== TAB 1: NUEVO PEDIDO ===============
 with tab1:
-    user_email = st.text_input("Usuario (email)")
+    user_email = st.text_input("Usuario (email)", key="email_new")
     file = st.file_uploader("Subir Excel", type=["xlsx"])
 
     if file:
@@ -212,40 +255,73 @@ with tab1:
 
             conn = get_conn()
             try:
+                estado_inicial = get_estado_texto_por_id(conn, DEFAULT_ESTADO_ID)
+
+                created = []
                 for (cli, rs), grp in df2.groupby(["CLIENTE", "rs"]):
                     numero = gen_numero(f"COMEX-P{int(cli)}")
                     insert_lines(conn, grp, numero, user_email.strip())
+
+                    # LOG estado inicial en pedidos_meta_id
+                    insert_pedido_meta(
+                        conn,
+                        pedido=numero,
+                        estado_texto=estado_inicial,
+                        usr=user_email.strip(),
+                    )
+
+                    created.append({"pedido": numero, "cliente": int(cli), "rs": rs, "estado": estado_inicial})
+
                 conn.commit()
-                st.success("Pedidos generados.")
+                st.success("Pedidos generados y registrados en pedidos_meta_id.")
+                st.dataframe(pd.DataFrame(created), use_container_width=True)
+
             except Exception as e:
                 conn.rollback()
                 st.exception(e)
             finally:
                 conn.close()
 
+# =============== TAB 2: PEDIDOS (EDIT + ESTADO) ===============
 with tab2:
-    st.subheader("Editar pedidos (precio y cantidad)")
+    st.subheader("Pedidos: editar líneas y cambiar estado")
+
+    user_email_pedidos = st.text_input("Usuario (email) para registrar cambios de estado", key="email_pedidos")
 
     conn = get_conn()
     try:
-        pedidos = list_pedidos(conn, limit=200)
+        estados_rows = get_estados(conn)
+        if not estados_rows:
+            st.error("La tabla comex_estados no tiene registros.")
+            st.stop()
+
+        # Lista de estados por texto (lo que se guarda en pedidos_meta_id.estado)
+        estados_textos = [r["estado"] for r in estados_rows]
+
+        pedidos = get_pedidos_with_estado_actual(conn, limit=300)
         if not pedidos:
             st.info("No hay pedidos cargados todavía.")
             st.stop()
 
-        # Dropdown con etiqueta útil
         meta = {}
-        options = []
+        labels = []
         for p in pedidos:
-            numero = p["NUMERO"]
-            label = f"{numero}  |  {p.get('rs') or ''}  |  {str(p.get('last_ts') or '')}"
-            options.append(label)
-            meta[label] = numero
+            pedido = p["pedido"]
+            estado = p["estado_texto"] or "(sin estado)"
+            rs = p.get("rs") or ""
+            last_ts = str(p.get("last_ts") or "")
+            label = f"{pedido}  |  {estado}  |  {rs}  |  {last_ts}"
+            labels.append(label)
+            meta[label] = {"pedido": pedido, "estado": estado if estado != "(sin estado)" else None}
 
-        sel = st.selectbox("Seleccioná un pedido", options, index=0)
-        numero = meta[sel]
+        sel = st.selectbox("Seleccioná un pedido", labels, index=0)
+        pedido_sel = meta[sel]["pedido"]
+        estado_actual = meta[sel]["estado"]
 
-        df_lines = load_pedido_lines(conn, numero)
+        st.divider()
+
+        # --- Editor de líneas ---
+        df_lines = load_pedido_lines(conn, pedido_sel)
         if df_lines.empty:
             st.warning("El pedido no tiene líneas.")
             st.stop()
@@ -260,7 +336,7 @@ with tab2:
                 "CANTIDAD": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.3f"),
                 "PRECIO": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.4f"),
             },
-            key=f"edit_{numero}",
+            key=f"edit_{pedido_sel}",
         )
 
         # Totales en vivo
@@ -270,7 +346,24 @@ with tab2:
         c1.metric("Total USD", f"{tmp['IMP'].sum():,.2f}")
         c2.metric("Total Qty", f"{tmp['CANTIDAD'].sum():,.3f}")
 
-        def validate(dfv):
+        st.divider()
+
+        # --- Cambio de estado ---
+        # Preselección del estado actual
+        if estado_actual in estados_textos:
+            default_idx = estados_textos.index(estado_actual)
+        else:
+            default_idx = 0
+
+        st.subheader("Estado del pedido")
+        new_estado = st.selectbox(
+            "Seleccioná nuevo estado",
+            estados_textos,
+            index=default_idx,
+            key=f"estado_{pedido_sel}",
+        )
+
+        def validate_lines(dfv):
             q = pd.to_numeric(dfv["CANTIDAD"], errors="coerce")
             p = pd.to_numeric(dfv["PRECIO"], errors="coerce")
             if q.isna().any() or p.isna().any():
@@ -279,20 +372,45 @@ with tab2:
                 return False
             return True
 
-        if st.button("💾 Guardar cambios", type="primary"):
-            if not validate(edited):
-                st.error("Hay valores inválidos (cantidad/precio deben ser numéricos y > 0).")
-                st.stop()
+        colA, colB = st.columns([1, 1])
 
-            df_to_save = edited[["ITEM", "CANTIDAD", "PRECIO"]].copy()
+        with colA:
+            if st.button("💾 Guardar cambios de líneas", type="primary"):
+                if not validate_lines(edited):
+                    st.error("Valores inválidos (cantidad/precio deben ser numéricos y > 0).")
+                    st.stop()
 
-            try:
-                update_pedido_lines(conn, numero, df_to_save)
-                conn.commit()
-                st.success("Cambios guardados.")
-            except Exception as e:
-                conn.rollback()
-                st.exception(e)
+                df_to_save = edited[["ITEM", "CANTIDAD", "PRECIO"]].copy()
+                try:
+                    update_pedido_lines(conn, pedido_sel, df_to_save)
+                    conn.commit()
+                    st.success("Líneas actualizadas.")
+                except Exception as e:
+                    conn.rollback()
+                    st.exception(e)
+
+        with colB:
+            if st.button("🧾 Registrar cambio de estado", type="secondary"):
+                if not user_email_pedidos.strip():
+                    st.error("Ingresá el email del usuario para registrar el cambio de estado.")
+                    st.stop()
+
+                # Evitar duplicar el mismo estado (por defecto)
+                if estado_actual == new_estado:
+                    st.info("El pedido ya está en ese estado. No se registró un nuevo movimiento.")
+                else:
+                    try:
+                        insert_pedido_meta(
+                            conn,
+                            pedido=pedido_sel,
+                            estado_texto=new_estado,
+                            usr=user_email_pedidos.strip(),
+                        )
+                        conn.commit()
+                        st.success(f"Estado '{new_estado}' registrado en pedidos_meta_id.")
+                    except Exception as e:
+                        conn.rollback()
+                        st.exception(e)
 
     finally:
         conn.close()
