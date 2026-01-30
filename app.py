@@ -4,13 +4,20 @@ import pymysql
 import os
 from datetime import datetime
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 # ---------------- CONFIG ----------------
 REQUIRED_COLS = ["cod_alfa", "price", "quantity"]
 DEFAULT_ESTADO_ID = 1  # equivale a "Armado" en comex_estados
+TZ_AR = ZoneInfo("America/Argentina/Buenos_Aires")
 
 st.set_page_config(page_title="Pedidos COMEX", layout="wide")
 st.title("Pedidos COMEX")
+
+# ---------------- TIME ----------------
+def now_ar():
+    # TS en UTC-3 (Buenos Aires) pero sin tzinfo (compatible con DATETIME MySQL)
+    return datetime.now(TZ_AR).replace(tzinfo=None)
 
 # ---------------- DB ----------------
 def get_conn():
@@ -46,7 +53,7 @@ def load_articulos(conn, cods):
         return pd.DataFrame(cur.fetchall())
 
 def gen_numero(pref="COMEX"):
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ts = now_ar().strftime("%Y%m%d-%H%M%S")
     return f"{pref}-{ts}-{str(uuid4())[:4]}"
 
 # --------- Estados / Meta (según tus DDL) ---------
@@ -66,7 +73,7 @@ def get_estado_texto_por_id(conn, estado_id: int) -> str:
     return row["estado"]
 
 def insert_pedido_meta(conn, pedido: str, estado_texto: str, usr: str):
-    ts = datetime.now()
+    ts = now_ar()
     sql = """
         INSERT INTO pedidos_meta_id (pedido, estado, ts, usr)
         VALUES (%s, %s, %s, %s)
@@ -124,7 +131,7 @@ def get_pedidos_index(conn, limit=1000):
 
 # --------- sap_comex lines ---------
 def insert_lines(conn, df, numero, user_email):
-    now = datetime.now()
+    ts_now = now_ar()
     rows = []
     item = 1
     for _, r in df.iterrows():
@@ -141,7 +148,7 @@ def insert_lines(conn, df, numero, user_email):
                 0,
                 "N",
                 user_email,
-                now,
+                ts_now,
             )
         )
         item += 1
@@ -165,6 +172,8 @@ def insert_lines(conn, df, numero, user_email):
         cur.executemany(sql, rows)
 
 def load_pedido_lines(conn, numero):
+    # seguimos trayendo todo desde SQL (por si necesitás en otro lado),
+    # pero en UI vamos a ocultar columnas.
     sql = """
         SELECT
             ITEM, COD_ALFA, CANTIDAD, PRECIO, rs, TS, user_email, sap_ready, proc_sap
@@ -184,14 +193,14 @@ def update_pedido_lines(conn, numero, df_edit):
             TS       = %s
         WHERE NUMERO = %s AND ITEM = %s
     """
-    now = datetime.now()
+    ts_now = now_ar()
     payload = []
     for _, r in df_edit.iterrows():
         payload.append(
             (
                 float(r["CANTIDAD"]),
                 float(r["PRECIO"]),
-                now,
+                ts_now,
                 numero,
                 int(r["ITEM"]),
             )
@@ -282,7 +291,7 @@ with tab1:
                     )
 
                 conn.commit()
-                st.success("Pedidos generados y registrados en pedidos_meta_id.")
+                st.success("Pedidos Generados y registrados en vicomx")
                 st.dataframe(pd.DataFrame(created), use_container_width=True)
 
             except Exception as e:
@@ -308,7 +317,6 @@ with tab2:
             st.info("No hay pedidos cargados todavía.")
             st.stop()
 
-        # -------- Selectores lado a lado: PROVEEDOR (izq) y PEDIDO (der) --------
         idx["proveedor_label"] = idx["proveedor"].astype(str) + " - " + idx["rs"].fillna("")
         proveedores = idx[["proveedor", "rs", "proveedor_label"]].drop_duplicates().sort_values("proveedor_label")
 
@@ -351,7 +359,7 @@ with tab2:
         with st.expander("🧾 Detalle / Trazabilidad del pedido", expanded=True):
             traz = get_trazabilidad(conn, pedido_sel)
             if traz.empty:
-                st.info("Este pedido no tiene trazabilidad registrada en pedidos_meta_id.")
+                st.info("Este pedido no tiene trazabilidad registrada en vicomx")
             else:
                 last = traz.iloc[-1]
                 st.markdown(
@@ -370,13 +378,15 @@ with tab2:
             st.warning("El pedido no tiene líneas.")
             st.stop()
 
+        # UI: eliminar columnas TS, USER_EMAIL, SAP_READY, PROC_SAP
         df_lines_ui = df_lines.rename(columns={"rs": "RAZON SOCIAL", "user_email": "USER_EMAIL"}).copy()
+        df_lines_ui = df_lines_ui.drop(columns=["TS", "USER_EMAIL", "sap_ready", "proc_sap"], errors="ignore")
 
         edited = st.data_editor(
             df_lines_ui,
             use_container_width=True,
             hide_index=True,
-            disabled=["ITEM", "COD_ALFA", "RAZON SOCIAL", "TS", "USER_EMAIL", "sap_ready", "proc_sap"],
+            disabled=["ITEM", "COD_ALFA", "RAZON SOCIAL"],
             column_config={
                 "CANTIDAD": st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
                 "PRECIO": st.column_config.NumberColumn(min_value=0.0, step=0.1, format="%.4f"),
@@ -387,12 +397,10 @@ with tab2:
         tmp = edited.copy()
         tmp["IMP"] = tmp["CANTIDAD"] * tmp["PRECIO"]
 
-        # INVERTIR: primero Cantidad Total, luego ST USD
         c1, c2 = st.columns(2)
         c1.metric("Cantidad Total", f"{tmp['CANTIDAD'].sum():,.0f}")
         c2.metric("ST USD", f"{tmp['IMP'].sum():,.2f}")
 
-        # Guardar debajo de métricas
         if st.button("Guardar Modificaciones", type="primary"):
             def validate_lines(dfv):
                 q = pd.to_numeric(dfv["CANTIDAD"], errors="coerce")
@@ -437,7 +445,6 @@ with tab2:
             )
 
         with e2:
-            # Spacer para alinear visualmente el botón con el selectbox
             st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
             if st.button("Registrar cambio de estado", type="secondary"):
                 if not user_email_pedidos.strip():
@@ -455,7 +462,7 @@ with tab2:
                             usr=user_email_pedidos.strip(),
                         )
                         conn.commit()
-                        st.success(f"Estado '{new_estado}' registrado en pedidos_meta_id.")
+                        st.success(f"'{new_estado}' registrado en vicomx")
                     except Exception as e:
                         conn.rollback()
                         st.exception(e)
